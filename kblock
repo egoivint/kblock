@@ -1,0 +1,816 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""kblock — временная блокировка клавиатуры (X11 и Wayland).
+
+X11: клавиатура забирается активным grab'ом X-сервера (XGrabKeyboard).
+Wayland: используется эксклюзивный захват evdev-устройств (EVIOCGRAB), потому
+что Wayland не разрешает клиентам глобальные захваты клавиатуры. Для второго
+варианта нужен доступ к /dev/input/event* — один раз запустите
+setup-input-access.sh (см. README).
+
+Захват снимается автоматически, если процесс завершится или упадёт.
+Разблокировка: по таймауту (по умолчанию 30 с) или удержанием клавиши
+(по умолчанию Esc, 2 с).
+
+Примеры:
+    kblock                     # авто: X11 или evdev
+    kblock -t 90 -p            # 90 секунд, блокировать ещё мышь/тачпад
+    kblock -d 3 -t 60          # 3 с на «убрать руки», затем блокировка
+    kblock --backend x11       # принудительно X11
+    kblock --backend evdev     # принудительно evdev (Wayland/TTY)
+    kblock -t 0                # без таймаута (только удержанием Esc)
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import ctypes.util
+import fcntl
+import math
+import os
+import re
+import select
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import time
+from typing import NoReturn
+
+VERSION = "1.0"
+
+# ---- константы X11 -------------------------------------------------------
+
+KEY_PRESS = 2
+KEY_RELEASE = 3
+
+GRAB_SUCCESS = 0
+GRAB_MODE_ASYNC = 1
+CURRENT_TIME = 0
+NONE = 0
+
+BUTTON_PRESS_MASK = 1 << 2
+BUTTON_RELEASE_MASK = 1 << 3
+POINTER_MOTION_MASK = 1 << 6
+
+GRAB_ERRORS = {
+    1: "клавиатура уже захвачена другой программой",
+    2: "некорректное время захвата",
+    3: "окно захвата не отображается",
+    4: "устройство заморожено другим клиентом",
+}
+
+# ---- константы evdev -----------------------------------------------------
+
+EV_KEY = 1
+EV_ABS = 3
+
+KEY_ESC = 1
+KEY_SPACE = 57
+KEY_A = 30
+BTN_LEFT = 0x110
+BTN_TOUCH = 0x14A
+
+_IOC_READ = 2
+_IOC_WRITE = 1
+
+
+def _ioc(direction: int, type_char: str, nr: int, size: int) -> int:
+    return (direction << 30) | (size << 16) | (ord(type_char) << 8) | nr
+
+
+def _eviocgbit(ev_type: int, size: int) -> int:
+    return _ioc(_IOC_READ, "E", 0x20 + ev_type, size)
+
+
+EVIO_CGRAB = _ioc(_IOC_WRITE, "E", 0x90, 4)
+EVENT_FORMAT = ("llHHi" if ctypes.sizeof(ctypes.c_long) == 8 else "iiHHi")
+INPUT_EVENT = struct.Struct(EVENT_FORMAT)
+
+# Имена клавиш для evdev-бэкенда (X11-бэкенд понимает любые X keysym).
+EVDEV_KEYS = {
+    "Escape": KEY_ESC,
+    "Esc": KEY_ESC,
+    "space": KEY_SPACE,
+    "Tab": 15,
+    "Return": 28,
+    "Delete": 111,
+    "Insert": 110,
+    "Home": 102,
+    "End": 107,
+    "Page_Up": 104,
+    "Page_Down": 109,
+    "Scroll_Lock": 70,
+    "Pause": 119,
+    "F1": 59, "F2": 60, "F3": 61, "F4": 62, "F5": 63, "F6": 64,
+    "F7": 65, "F8": 66, "F9": 67, "F10": 68, "F11": 87, "F12": 88,
+}
+
+
+class XKeyEvent(ctypes.Structure):
+    """Событие клавиатуры X11; XEvent больше, читаем нужные поля."""
+
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("root", ctypes.c_ulong),
+        ("subwindow", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("x_root", ctypes.c_int),
+        ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint),
+        ("keycode", ctypes.c_uint),
+        ("same_screen", ctypes.c_int),
+    ]
+
+
+def die(message: str) -> NoReturn:
+    print(f"kblock: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def notify(enabled: bool, summary: str, body: str = "") -> None:
+    if not enabled:
+        return
+    exe = shutil.which("notify-send")
+    if not exe:
+        return
+    cmd = [exe, "-a", "kblock", "-t", "4000", summary]
+    if body:
+        cmd.append(body)
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+class X11:
+    """Минимальная обёртка над libX11 через ctypes."""
+
+    def __init__(self) -> None:
+        name = ctypes.util.find_library("X11") or "libX11.so.6"
+        try:
+            self.lib = ctypes.CDLL(name)
+        except OSError as exc:
+            die(f"не удалось загрузить libX11: {exc}")
+        self._declare()
+        self.dpy = self.lib.XOpenDisplay(None)
+        if not self.dpy:
+            die("не удалось подключиться к X-серверу (проверьте DISPLAY)")
+        self.root = self.lib.XDefaultRootWindow(self.dpy)
+        self.fd = self.lib.XConnectionNumber(self.dpy)
+        self.buf = ctypes.create_string_buffer(192)  # sizeof(XEvent) на 64-bit
+        self.pointer_grabbed = False
+
+        # Отключаем «фальшивые» KeyRelease/KeyPress от автоповтора: иначе
+        # удержание Esc невозможно отличить от серии повторов.
+        supported = ctypes.c_int(0)
+        ok = self.lib.XkbSetDetectableAutoRepeat(self.dpy, 1, ctypes.byref(supported))
+        self.detectable_repeat = bool(ok and supported.value)
+
+    def _declare(self) -> None:
+        lib = self.lib
+        lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        lib.XOpenDisplay.restype = ctypes.c_void_p
+        lib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        lib.XDefaultRootWindow.restype = ctypes.c_ulong
+        lib.XConnectionNumber.argtypes = [ctypes.c_void_p]
+        lib.XConnectionNumber.restype = ctypes.c_int
+        lib.XGrabKeyboard.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_ulong,
+        ]
+        lib.XGrabKeyboard.restype = ctypes.c_int
+        lib.XUngrabKeyboard.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        lib.XGrabPointer.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_uint,
+            ctypes.c_int, ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+            ctypes.c_ulong,
+        ]
+        lib.XGrabPointer.restype = ctypes.c_int
+        lib.XUngrabPointer.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        lib.XPending.argtypes = [ctypes.c_void_p]
+        lib.XPending.restype = ctypes.c_int
+        lib.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.XNextEvent.restype = ctypes.c_int
+        lib.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        lib.XKeysymToKeycode.restype = ctypes.c_ubyte
+        lib.XStringToKeysym.argtypes = [ctypes.c_char_p]
+        lib.XStringToKeysym.restype = ctypes.c_ulong
+        lib.XkbSetDetectableAutoRepeat.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+        ]
+        lib.XkbSetDetectableAutoRepeat.restype = ctypes.c_int
+        lib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+
+    def keycode(self, name: str) -> int:
+        keysym = self.lib.XStringToKeysym(name.encode())
+        if not keysym:
+            die(f"неизвестное имя клавиши: {name!r} (примеры: Escape, F12, Scroll_Lock)")
+        code = self.lib.XKeysymToKeycode(self.dpy, keysym)
+        if not code:
+            die(f"клавиша {name!r} не сопоставлена ни одному keycode")
+        return int(code)
+
+    def grab_keyboard(self) -> int:
+        return self.lib.XGrabKeyboard(
+            self.dpy, self.root, False, GRAB_MODE_ASYNC, GRAB_MODE_ASYNC, CURRENT_TIME
+        )
+
+    def grab_pointer(self) -> int:
+        status = self.lib.XGrabPointer(
+            self.dpy, self.root, False,
+            BUTTON_PRESS_MASK | BUTTON_RELEASE_MASK | POINTER_MOTION_MASK,
+            GRAB_MODE_ASYNC, GRAB_MODE_ASYNC, NONE, NONE, CURRENT_TIME,
+        )
+        self.pointer_grabbed = status == GRAB_SUCCESS
+        return status
+
+    def pending(self) -> bool:
+        return bool(self.lib.XPending(self.dpy))
+
+    def next_key_event(self):
+        self.lib.XNextEvent(self.dpy, self.buf)
+        return ctypes.cast(self.buf, ctypes.POINTER(XKeyEvent)).contents
+
+    def wait(self, seconds: float) -> None:
+        try:
+            select.select([self.fd], [], [], max(0.0, seconds))
+        except InterruptedError:
+            pass
+
+    def sync(self) -> None:
+        self.lib.XSync(self.dpy, 0)
+
+    def cleanup(self) -> None:
+        if not self.dpy:
+            return
+        self.lib.XUngrabKeyboard(self.dpy, CURRENT_TIME)
+        if self.pointer_grabbed:
+            self.lib.XUngrabPointer(self.dpy, CURRENT_TIME)
+        self.sync()
+        self.lib.XCloseDisplay(self.dpy)
+        self.dpy = None
+
+
+# ---- вывод ---------------------------------------------------------------
+
+class Screen:
+    def __init__(self) -> None:
+        self.tty = sys.stdout.isatty()
+
+    def update(self, text: str) -> None:
+        if self.tty:
+            sys.stdout.write("\r\x1b[2K" + text)
+            sys.stdout.flush()
+
+    def line(self, text: str) -> None:
+        if self.tty:
+            sys.stdout.write("\r\x1b[2K" + text + "\n")
+            sys.stdout.flush()
+        else:
+            print(text, flush=True)
+
+
+def fmt_secs(seconds: float) -> str:
+    if seconds >= 10:
+        return f"{math.ceil(seconds)} с"
+    return f"{max(0.0, seconds):.1f} с"
+
+
+def lock_header(what: str, timeout: float, key_name: str, hold: float) -> str:
+    tail = f"{key_name} {hold:g} с — разблокировать"
+    if timeout > 0:
+        return f"{what} на {timeout:g} с · {tail}"
+    return f"{what} без таймаута · {tail}"
+
+
+def status_text(now: float, start: float, deadline, held,
+                hold: float, key_name: str) -> str:
+    if deadline is not None:
+        left = f"осталось {fmt_secs(deadline - now)}"
+    else:
+        left = f"прошло {fmt_secs(now - start)}"
+    if held is not None:
+        hint = f"{key_name}: {held:.1f}/{hold:g} с"
+    else:
+        hint = f"удерживайте {key_name} {hold:g} с для выхода"
+    return f"⌨  заблокировано · {left} · {hint}"
+
+
+class Progress:
+    """Печатает HOLD <удержано> <всего> для GUI (флаг --progress)."""
+
+    def __init__(self, enabled: bool, total: float) -> None:
+        self.enabled = enabled
+        self.total = total
+        self.last = -1.0
+
+    def __call__(self, held: float) -> None:
+        if not self.enabled:
+            return
+        if held <= 0:
+            if self.last == 0.0:
+                return
+            self.last = 0.0
+            print(f"HOLD 0.000 {self.total:.3f}", flush=True)
+            return
+        if abs(held - self.last) < 0.03:
+            return
+        self.last = held
+        print(f"HOLD {held:.3f} {self.total:.3f}", flush=True)
+
+
+def countdown(screen: Screen, seconds: float) -> None:
+    end = time.monotonic() + seconds
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            break
+        screen.update(f"блокировка через {math.ceil(left)} с… (Ctrl+C — отмена)")
+        time.sleep(min(0.1, left))
+    screen.update("блокировка…")
+
+
+# ---- evdev ---------------------------------------------------------------
+
+def iter_event_devices():
+    base = "/dev/input"
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return
+    for name in sorted(names):
+        if re.fullmatch(r"event\d+", name):
+            yield os.path.join(base, name)
+
+
+def _has_event_type(fd: int, ev_type: int) -> bool:
+    buf = bytearray(8)
+    fcntl.ioctl(fd, _eviocgbit(0, len(buf)), buf, True)
+    return bool(buf[ev_type // 8] & (1 << (ev_type % 8)))
+
+
+def _has_keys(fd: int, codes) -> bool:
+    length = max(codes) // 8 + 1
+    buf = bytearray(length)
+    fcntl.ioctl(fd, _eviocgbit(EV_KEY, length), buf, True)
+    return all(buf[code // 8] & (1 << (code % 8)) for code in codes)
+
+
+def classify_device(fd: int, block_pointer: bool) -> str | None:
+    if not _has_event_type(fd, EV_KEY):
+        return None
+    keyboard = _has_keys(fd, (KEY_ESC, KEY_A, KEY_SPACE))
+    pointer = False
+    if block_pointer:
+        pointer = _has_keys(fd, (BTN_LEFT,)) or (
+            _has_event_type(fd, EV_ABS) and _has_keys(fd, (BTN_TOUCH,))
+        )
+    if keyboard and pointer:
+        return "both"
+    if keyboard:
+        return "keyboard"
+    if pointer:
+        return "pointer"
+    return None
+
+
+class InputAccessError(Exception):
+    pass
+
+
+class EvdevLocker:
+    def __init__(self, args, key_code: int, key_name: str, screen: Screen,
+                 progress: "Progress") -> None:
+        self.args = args
+        self.key_code = key_code
+        self.key_name = key_name
+        self.screen = screen
+        self.progress = progress
+        self.fds: dict[str, int] = {}
+        self.kinds: dict[str, str] = {}
+        self.denied = 0
+        self.busy = 0
+        self.pressed_at = None
+        self.last_scan = 0.0
+        self.last_draw = 0.0
+        self.start = time.monotonic()
+        self.deadline = self.start + args.timeout if args.timeout > 0 else None
+        self.keyboards = 0
+        self.pointers = 0
+
+    def _scan(self) -> None:
+        for path in iter_event_devices():
+            if path in self.fds:
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+            except PermissionError:
+                self.denied += 1
+                continue
+            except OSError:
+                continue
+            try:
+                kind = classify_device(fd, self.args.pointer)
+                if kind is None:
+                    os.close(fd)
+                    continue
+                fcntl.ioctl(fd, EVIO_CGRAB, 1)
+            except PermissionError:
+                self.denied += 1
+                os.close(fd)
+                continue
+            except OSError:
+                # EBUSY и прочие ошибки — устройство уже занято
+                self.busy += 1
+                os.close(fd)
+                continue
+            self.fds[path] = fd
+            self.kinds[path] = kind
+        self.last_scan = time.monotonic()
+        self.keyboards = sum(1 for kind in self.kinds.values()
+                             if kind in ("keyboard", "both"))
+        self.pointers = sum(1 for kind in self.kinds.values()
+                            if kind in ("pointer", "both"))
+
+    def _drop(self, path: str) -> None:
+        fd = self.fds.pop(path, None)
+        self.kinds.pop(path, None)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def grab(self) -> tuple[int, int]:
+        self._scan()
+        if self.keyboards == 0:
+            self.release()
+            if self.denied:
+                raise InputAccessError
+            if self.busy:
+                raise RuntimeError("устройства ввода уже заняты другим процессом")
+            raise RuntimeError("не найдены клавиатуры в /dev/input/event*")
+        return self.keyboards, self.pointers
+
+    def release(self) -> None:
+        for fd in list(self.fds.values()):
+            try:
+                fcntl.ioctl(fd, EVIO_CGRAB, 0)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.fds.clear()
+        self.kinds.clear()
+
+    def _draw(self, now: float) -> None:
+        if now - self.last_draw < 0.1:
+            return
+        self.last_draw = now
+        held = None if self.pressed_at is None else min(
+            now - self.pressed_at, self.args.hold)
+        self.progress(0.0 if held is None else held)
+        self.screen.update(status_text(now, self.start, self.deadline, held,
+                                       self.args.hold, self.key_name))
+
+    def run(self) -> str:
+        reason = ""
+        while True:
+            now = time.monotonic()
+            if self.deadline is not None and now >= self.deadline:
+                reason = f"таймаут {self.args.timeout:g} с"
+                break
+            if now - self.last_scan >= 1.0:
+                self._scan()
+            if not self.fds:
+                reason = "устройства ввода отключились"
+                break
+
+            try:
+                ready, _, _ = select.select(list(self.fds.values()), [], [], 0.2)
+            except InterruptedError:
+                ready = []
+
+            for fd in ready:
+                path = next((p for p, value in self.fds.items() if value == fd), None)
+                try:
+                    data = os.read(fd, INPUT_EVENT.size * 64)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    if path:
+                        self._drop(path)
+                    continue
+                event_time = time.monotonic()
+                for offset in range(0, len(data) - INPUT_EVENT.size + 1,
+                                    INPUT_EVENT.size):
+                    _sec, _usec, etype, code, value = INPUT_EVENT.unpack_from(
+                        data, offset,
+                    )
+                    if etype != EV_KEY or code != self.key_code:
+                        continue
+                    if value == 1 and self.pressed_at is None:
+                        self.pressed_at = event_time
+                    elif value == 0 and self.pressed_at is not None:
+                        held = event_time - self.pressed_at
+                        self.pressed_at = None
+                        if held >= self.args.hold:
+                            self.progress(held)
+                            reason = (f"клавиша {self.key_name} "
+                                      f"удерживалась {held:.1f} с")
+                            break
+                        self.progress(0.0)
+                if reason:
+                    break
+
+            if reason:
+                break
+            if STOP_SIGNALS:
+                reason = f"получен сигнал {signal.Signals(STOP_SIGNALS[-1]).name}"
+                break
+            self._draw(now)
+
+        return reason
+
+
+# ---- X11-бэкенд ----------------------------------------------------------
+
+def run_x11(args, screen: Screen) -> int:
+    if not os.environ.get("DISPLAY"):
+        print("kblock: DISPLAY не задан. Для Wayland/TTY используйте "
+              "--backend evdev", file=sys.stderr)
+        return 2
+
+    x = X11()
+    progress = Progress(args.progress, args.hold)
+    try:
+        unlock_code = x.keycode(args.unlock_key)
+        key_name = args.unlock_key
+
+        if args.delay > 0:
+            countdown(screen, args.delay)
+
+        status = x.grab_keyboard()
+        if status != GRAB_SUCCESS:
+            die("не удалось захватить клавиатуру: "
+                f"{GRAB_ERRORS.get(status, f'код {status}')}")
+
+        if args.pointer:
+            if x.grab_pointer() == GRAB_SUCCESS:
+                what = "клавиатура и указатель заблокированы"
+            else:
+                what = "клавиатура заблокирована (указатель захватить не удалось)"
+        else:
+            what = "клавиатура заблокирована"
+        screen.line("⌨ " + lock_header(what, args.timeout, key_name, args.hold))
+        notify(args.notify, "Клавиатура заблокирована",
+               f"Снимется через {args.timeout:g} с или удержанием {key_name}")
+
+        try:
+            reason = run_lock(x, args, unlock_code, key_name, screen, progress)
+        except KeyboardInterrupt:
+            reason = "Ctrl+C"
+    finally:
+        x.cleanup()
+
+    screen.line(f"🔓 клавиатура разблокирована ({reason})")
+    notify(args.notify, "Клавиатура разблокирована", reason)
+    return 0
+
+
+def run_lock(x: X11, args, unlock_code: int, key_name: str,
+             screen: Screen, progress: Progress) -> str:
+    start = time.monotonic()
+    deadline = start + args.timeout if args.timeout > 0 else None
+    pressed_at = None
+    last_press_time = -1
+    last_draw = 0.0
+    reason = ""
+
+    while True:
+        now = time.monotonic()
+        if deadline is not None and now >= deadline:
+            reason = f"таймаут {args.timeout:g} с"
+            break
+
+        if x.pending():
+            ev = x.next_key_event()
+            if ev.type == KEY_PRESS and ev.keycode == unlock_code:
+                last_press_time = ev.time
+                if pressed_at is None:
+                    pressed_at = now
+                continue
+            if ev.type == KEY_RELEASE and ev.keycode == unlock_code:
+                if pressed_at is not None:
+                    repeated = (
+                        not x.detectable_repeat
+                        and ev.time == last_press_time
+                    )
+                    if not repeated:
+                        held = now - pressed_at
+                        pressed_at = None
+                        if held >= args.hold:
+                            progress(held)
+                            reason = (f"клавиша {key_name} "
+                                      f"удерживалась {held:.1f} с")
+                            break
+                        progress(0.0)
+            continue
+
+        if now - last_draw >= 0.1:
+            last_draw = now
+            held = None if pressed_at is None else min(now - pressed_at,
+                                                       args.hold)
+            if held is not None:
+                progress(held)
+            screen.update(status_text(now, start, deadline, held,
+                                      args.hold, key_name))
+
+        wait = 0.1
+        if deadline is not None:
+            wait = min(wait, max(0.01, deadline - now))
+        x.wait(wait)
+
+        if STOP_SIGNALS:
+            reason = f"получен сигнал {signal.Signals(STOP_SIGNALS[-1]).name}"
+            break
+
+    return reason
+
+
+# ---- evdev-бэкенд (main) -------------------------------------------------
+
+def setup_script_path() -> str:
+    here = os.path.dirname(os.path.realpath(__file__))
+    for path in (os.path.join(here, "setup-input-access.sh"),
+                 os.path.expanduser("~/.local/share/kblock/setup-input-access.sh"),
+                 "/usr/share/kblock/setup-input-access.sh"):
+        if os.path.isfile(path):
+            return path
+    return "setup-input-access.sh"
+
+
+def evdev_keycode(name: str) -> int:
+    code = EVDEV_KEYS.get(name)
+    if code is None:
+        names = ", ".join(sorted(EVDEV_KEYS))
+        die(f"для evdev неизвестно имя клавиши {name!r}. Доступны: {names}")
+    return code
+
+
+def run_evdev(args, screen: Screen) -> int:
+    key_code = evdev_keycode(args.unlock_key)
+    key_name = args.unlock_key
+
+    if args.delay > 0:
+        countdown(screen, args.delay)
+
+    progress = Progress(args.progress, args.hold)
+    locker = EvdevLocker(args, key_code, key_name, screen, progress)
+    try:
+        keyboards, pointers = locker.grab()
+    except InputAccessError:
+        print("kblock: нет доступа к /dev/input/event*.", file=sys.stderr)
+        print("Для Wayland один раз настройте доступ:", file=sys.stderr)
+        print(f"  sudo {setup_script_path()}", file=sys.stderr)
+        print("Подробнее — в README, раздел «Wayland».", file=sys.stderr)
+        return 3
+    except RuntimeError as exc:
+        die(str(exc))
+
+    try:
+        what = "клавиатура заблокирована"
+        if args.pointer:
+            if pointers:
+                what = "клавиатура и указатель заблокированы"
+            else:
+                what = "клавиатура заблокирована (указатель захватить не удалось)"
+        what += " (evdev)"
+        screen.line("⌨ " + lock_header(what, args.timeout, key_name, args.hold))
+        notify(args.notify, "Клавиатура заблокирована",
+               f"Снимется через {args.timeout:g} с или удержанием {key_name}")
+
+        try:
+            reason = locker.run()
+        except KeyboardInterrupt:
+            reason = "Ctrl+C"
+    finally:
+        locker.release()
+
+    screen.line(f"🔓 клавиатура разблокирована ({reason})")
+    notify(args.notify, "Клавиатура разблокирована", reason)
+    return 0
+
+
+# ---- выбор бэкенда -------------------------------------------------------
+
+def detect_backend(requested: str) -> str:
+    if requested != "auto":
+        return requested
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
+    if session_type == "wayland":
+        return "evdev"
+    if session_type == "x11":
+        return "x11"
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return "evdev"
+    if os.environ.get("DISPLAY"):
+        return "x11"
+    return "evdev"
+
+
+STOP_SIGNALS = []
+
+
+def _on_stop_signal(signum, _frame) -> None:
+    STOP_SIGNALS.append(signum)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="kblock",
+        description=("Временно блокирует клавиатуру (X11 или Wayland/evdev), "
+                     "чтобы её можно было протереть."),
+        epilog=("Захват снимается автоматически при завершении или падении "
+                "процесса. Если терминал не отвечает — дождитесь таймаута. "
+                "Для Wayland нужен доступ к /dev/input (setup-input-access.sh)."),
+    )
+    parser.add_argument(
+        "-t", "--timeout", type=float, default=30.0, metavar="СЕК",
+        help="блокировка снимется сама через СЕК секунд; 0 — без таймаута "
+             "(по умолчанию 30)",
+    )
+    parser.add_argument(
+        "-d", "--delay", type=float, default=0.0, metavar="СЕК",
+        help="подождать СЕК секунд перед блокировкой (убрать руки)",
+    )
+    parser.add_argument(
+        "-p", "--pointer", action="store_true",
+        help="заблокировать также указатель и кнопки мыши (полезно для тачпада)",
+    )
+    parser.add_argument(
+        "-k", "--unlock-key", default="Escape", metavar="КЛАВИША",
+        help="клавиша досрочной разблокировки (имя X11; для evdev — Escape, "
+             "F1..F12, Scroll_Lock и др.)",
+    )
+    parser.add_argument(
+        "--hold", type=float, default=2.0, metavar="СЕК",
+        help="сколько удерживать клавишу разблокировки (по умолчанию 2)",
+    )
+    parser.add_argument(
+        "--backend", choices=("auto", "x11", "evdev"), default="auto",
+        help="бэкенд блокировки: auto (по умолчанию), x11 или evdev",
+    )
+    parser.add_argument("--progress", action="store_true",
+                        help=argparse.SUPPRESS)
+    parser.add_argument(
+        "-n", "--notify", action="store_true",
+        help="показывать уведомления через notify-send",
+    )
+    parser.add_argument(
+        "-V", "--version", action="version", version=f"kblock {VERSION}",
+    )
+    return parser
+
+
+def validate(args) -> None:
+    for name, value in (("timeout", args.timeout), ("delay", args.delay),
+                        ("hold", args.hold)):
+        if not math.isfinite(value):
+            die(f"--{name} должно быть конечным числом")
+    if args.timeout < 0:
+        die("таймаут не может быть отрицательным")
+    if args.delay < 0:
+        die("задержка не может быть отрицательной")
+    if args.hold < 0.3:
+        die("--hold должен быть не меньше 0.3 с")
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    validate(args)
+    STOP_SIGNALS.clear()
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+        signal.signal(sig, _on_stop_signal)
+
+    screen = Screen()
+    backend = detect_backend(args.backend)
+    if backend == "evdev":
+        return run_evdev(args, screen)
+    return run_x11(args, screen)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

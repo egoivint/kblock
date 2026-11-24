@@ -1,0 +1,23 @@
+[Desktop Entry]
+Type=Application
+Name=kblock
+GenericName=Keyboard Lock
+GenericName[ru]=Блокировка клавиатуры
+GenericName[de]=Tastatursperre
+GenericName[es]=Bloqueo del teclado
+GenericName[fr]=Verrouillage du clavier
+GenericName[zh]=键盘锁定
+Comment=Lock the keyboard and mouse while you clean the device
+Comment[ru]=Блокировка клавиатуры и мыши, чтобы протереть устройство
+Comment[de]=Tastatur und Maus sperren, um das Gerät zu reinigen
+Comment[es]=Bloquea el teclado y el ratón para limpiar el dispositivo
+Comment[fr]=Verrouille le clavier et la souris pour nettoyer l’appareil
+Comment[zh]=锁定键盘和鼠标，方便清洁设备
+Exec=kblock-gui
+Icon=kblock
+Terminal=false
+Categories=Utility;
+Keywords=keyboard;lock;clean;блокировка;клавиатура;
+TryExec=kblock-gui
+StartupNotify=true
+StartupWMClass=kblock-gui

@@ -1,0 +1,1496 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""kblock-gui — графическая оболочка для kblock (GTK3, X11/Wayland, тёмная тема).
+
+Возможности:
+  * круглая кнопка блокировки;
+  * настройка времени блокировки и анимация удержания Esc;
+  * отключение мыши и тачпада на время блокировки;
+  * значок в системном лотке (StatusNotifierItem / AppIndicator) с меню;
+  * настройки запоминаются в ~/.config/kblock-gui.json.
+
+Языки: русский, английский, немецкий, испанский, французский, китайский.
+Язык выбирается в окне и запоминается; по умолчанию берётся из окружения.
+
+Для Wayland нужен доступ к /dev/input: один раз запустите
+setup-input-access.sh (см. README).
+
+Запуск: kblock-gui [--hidden] [--lang ru|en|de|es|fr|zh]
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "org.egoiv.kblock"
+CONFIG_PATH = os.path.expanduser("~/.config/kblock-gui.json")
+DEFAULTS = {"timeout": 60, "pointer": False}
+
+LANGUAGES = [
+    ("ru", "Русский"),
+    ("en", "English"),
+    ("de", "Deutsch"),
+    ("es", "Español"),
+    ("fr", "Français"),
+    ("zh", "中文"),
+]
+
+LANG_SHORT = {"ru": "RU", "en": "EN", "de": "DE", "es": "ES", "fr": "FR", "zh": "中文"}
+
+TRANSLATIONS = {
+    "ru": {
+        "subtitle": "Блокировка ввода для чистки клавиатуры",
+        "lock": "Заблокировать",
+        "caption": "на {seconds} с",
+        "unit": "сек",
+        "time_title": "Время блокировки",
+        "pointer_title": "Мышь и тачпад",
+        "pointer_subtitle": "Блокировать курсор и клики",
+        "language": "Язык",
+        "hint_idle": "Досрочная разблокировка — удерживайте Esc 2 с",
+        "hint_locked": "Удерживайте Esc 2 с, чтобы разблокировать",
+        "hint_locked_pointer": "Esc 2 с — разблокировать · мышь отключена",
+        "collapse": "Свернуть в трей",
+        "quit": "Выход",
+        "status_timeout": "Разблокировано (таймаут)",
+        "status_esc": "Разблокировано (Esc)",
+        "status_stopped": "Остановлено",
+        "status_error": "Не удалось заблокировать ввод",
+        "status_missing": "Не найден исполняемый файл kblock",
+        "status_launch_failed": "Не удалось запустить kblock: {err}",
+        "status_no_input_access": "Нет доступа к устройствам ввода — запустите setup-input-access.sh",
+        "tray_open": "Открыть окно",
+        "tray_lock": "Заблокировать сейчас",
+        "tray_quit": "Выход",
+        "tooltip_body": "Блокировка ввода для чистки",
+    },
+    "en": {
+        "subtitle": "Lock input for cleaning the keyboard",
+        "lock": "Lock",
+        "caption": "for {seconds} s",
+        "unit": "sec",
+        "time_title": "Lock duration",
+        "pointer_title": "Mouse and touchpad",
+        "pointer_subtitle": "Block cursor and clicks",
+        "language": "Language",
+        "hint_idle": "Early unlock — hold Esc for 2 s",
+        "hint_locked": "Hold Esc for 2 s to unlock",
+        "hint_locked_pointer": "Esc 2 s to unlock · mouse disabled",
+        "collapse": "Hide to tray",
+        "quit": "Quit",
+        "status_timeout": "Unlocked (timeout)",
+        "status_esc": "Unlocked (Esc)",
+        "status_stopped": "Stopped",
+        "status_error": "Failed to block input",
+        "status_missing": "kblock executable not found",
+        "status_launch_failed": "Failed to start kblock: {err}",
+        "status_no_input_access": "No access to input devices — run setup-input-access.sh",
+        "tray_open": "Open window",
+        "tray_lock": "Lock now",
+        "tray_quit": "Quit",
+        "tooltip_body": "Lock input while cleaning",
+    },
+    "de": {
+        "subtitle": "Eingabe zum Reinigen der Tastatur sperren",
+        "lock": "Sperren",
+        "caption": "für {seconds} s",
+        "unit": "Sek.",
+        "time_title": "Sperrdauer",
+        "pointer_title": "Maus und Touchpad",
+        "pointer_subtitle": "Zeiger und Klicks sperren",
+        "language": "Sprache",
+        "hint_idle": "Vorzeitig entsperren — Esc 2 s halten",
+        "hint_locked": "Esc 2 s halten zum Entsperren",
+        "hint_locked_pointer": "Esc 2 s zum Entsperren · Maus aus",
+        "collapse": "In den Tray",
+        "quit": "Beenden",
+        "status_timeout": "Entsperrt (Zeitablauf)",
+        "status_esc": "Entsperrt (Esc)",
+        "status_stopped": "Gestoppt",
+        "status_error": "Eingabe konnte nicht gesperrt werden",
+        "status_missing": "Programm kblock nicht gefunden",
+        "status_launch_failed": "kblock konnte nicht gestartet werden: {err}",
+        "status_no_input_access": "Kein Zugriff auf Eingabegeräte — setup-input-access.sh ausführen",
+        "tray_open": "Fenster öffnen",
+        "tray_lock": "Jetzt sperren",
+        "tray_quit": "Beenden",
+        "tooltip_body": "Eingabe beim Reinigen sperren",
+    },
+    "es": {
+        "subtitle": "Bloqueo de entrada para limpiar el teclado",
+        "lock": "Bloquear",
+        "caption": "durante {seconds} s",
+        "unit": "s",
+        "time_title": "Duración del bloqueo",
+        "pointer_title": "Ratón y touchpad",
+        "pointer_subtitle": "Bloquear cursor y clics",
+        "language": "Idioma",
+        "hint_idle": "Desbloqueo anticipado: mantén Esc 2 s",
+        "hint_locked": "Mantén Esc 2 s para desbloquear",
+        "hint_locked_pointer": "Esc 2 s para desbloquear · ratón desactivado",
+        "collapse": "Ocultar en la bandeja",
+        "quit": "Salir",
+        "status_timeout": "Desbloqueado (tiempo)",
+        "status_esc": "Desbloqueado (Esc)",
+        "status_stopped": "Detenido",
+        "status_error": "No se pudo bloquear la entrada",
+        "status_missing": "No se encontró el ejecutable kblock",
+        "status_launch_failed": "No se pudo iniciar kblock: {err}",
+        "status_no_input_access": "Sin acceso a los dispositivos de entrada: ejecute setup-input-access.sh",
+        "tray_open": "Abrir ventana",
+        "tray_lock": "Bloquear ahora",
+        "tray_quit": "Salir",
+        "tooltip_body": "Bloquea la entrada para limpiar",
+    },
+    "fr": {
+        "subtitle": "Verrouillage de l’entrée pour nettoyer le clavier",
+        "lock": "Verrouiller",
+        "caption": "pendant {seconds} s",
+        "unit": "s",
+        "time_title": "Durée du verrouillage",
+        "pointer_title": "Souris et pavé tactile",
+        "pointer_subtitle": "Bloquer le curseur et les clics",
+        "language": "Langue",
+        "hint_idle": "Déverrouillage rapide — maintenez Échap 2 s",
+        "hint_locked": "Maintenez Échap 2 s pour déverrouiller",
+        "hint_locked_pointer": "Échap 2 s pour déverrouiller · souris désactivée",
+        "collapse": "Réduire dans la barre",
+        "quit": "Quitter",
+        "status_timeout": "Déverrouillé (délai)",
+        "status_esc": "Déverrouillé (Échap)",
+        "status_stopped": "Arrêté",
+        "status_error": "Impossible de bloquer l’entrée",
+        "status_missing": "Exécutable kblock introuvable",
+        "status_launch_failed": "Impossible de lancer kblock : {err}",
+        "status_no_input_access": "Pas d’accès aux périphériques d’entrée — exécutez setup-input-access.sh",
+        "tray_open": "Ouvrir la fenêtre",
+        "tray_lock": "Verrouiller maintenant",
+        "tray_quit": "Quitter",
+        "tooltip_body": "Verrouiller l’entrée pendant le nettoyage",
+    },
+    "zh": {
+        "subtitle": "锁定输入以清洁键盘",
+        "lock": "锁定",
+        "caption": "{seconds} 秒",
+        "unit": "秒",
+        "time_title": "锁定时间",
+        "pointer_title": "鼠标和触摸板",
+        "pointer_subtitle": "锁定光标和点击",
+        "language": "语言",
+        "hint_idle": "提前解锁 — 长按 Esc 2 秒",
+        "hint_locked": "长按 Esc 2 秒解锁",
+        "hint_locked_pointer": "Esc 2 秒解锁 · 鼠标已锁定",
+        "collapse": "隐藏到托盘",
+        "quit": "退出",
+        "status_timeout": "已解锁（超时）",
+        "status_esc": "已解锁（Esc）",
+        "status_stopped": "已停止",
+        "status_error": "无法锁定输入",
+        "status_missing": "未找到 kblock 可执行文件",
+        "status_launch_failed": "无法启动 kblock：{err}",
+        "status_no_input_access": "无法访问输入设备 — 请运行 setup-input-access.sh",
+        "tray_open": "打开窗口",
+        "tray_lock": "立即锁定",
+        "tray_quit": "退出",
+        "tooltip_body": "清洁时锁定输入",
+    },
+}
+
+
+def detect_language() -> str:
+    """Язык из окружения, если он есть среди переводов."""
+    for var in ("LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG"):
+        value = os.environ.get(var) or ""
+        code = value.split(".")[0].split("_")[0].split(":")[0].lower()
+        if code in TRANSLATIONS:
+            return code
+        if value:
+            break
+    return "en"
+
+
+# --------------------------------------------------------------------------
+# конфигурация
+# --------------------------------------------------------------------------
+
+CSS = b"""
+window.kblock-window { background-color: transparent; }
+window.kblock-window.no-composite { background-color: #16181d; }
+
+box.frame.no-composite { border-radius: 0; }
+
+box.frame {
+  background-color: #16181d;
+  border-radius: 16px;
+}
+
+headerbar.kblock-header {
+  background-color: transparent;
+  background-image: none;
+  border-bottom: 1px solid #23262d;
+  box-shadow: none;
+  color: #f2f3f5;
+}
+
+label.title { font-size: 17px; font-weight: 700; color: #f2f3f5; }
+label.subtitle { font-size: 11px; color: #8b919c; }
+label.hint { font-size: 12px; color: #9aa1ad; }
+label.status { font-size: 12px; color: #8b919c; }
+label.status.error { color: #ff7b72; }
+label.status.ok { color: #7bd88f; }
+
+box.card {
+  background-color: #22252c;
+  border-radius: 16px;
+  border: 1px solid #2b2f38;
+}
+box.card label { color: #e8eaed; }
+box.card label.subtitle { color: #8b919c; }
+
+button.lock {
+  border-radius: 100px;
+  background-image: none;
+  background-color: #3d6fd8;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.35);
+  padding: 0;
+  color: #ffffff;
+}
+button.lock:hover { background-color: #4b7ee8; }
+button.lock:focus { outline: none; }
+button.lock:active { background-color: #345fbe; }
+button.lock image { color: #ffffff; }
+button.lock label { font-size: 15px; font-weight: 600; color: #ffffff; }
+button.lock label.big { font-size: 52px; font-weight: 700; color: #8ab4ff; }
+button.lock label.caption { font-size: 11px; color: #c7d6f5; }
+button.lock.locked {
+  background-color: #1b1f27;
+  border: 1px solid #3d6fd8;
+  box-shadow: 0 0 0 6px rgba(61, 111, 216, 0.12);
+}
+
+button.flat {
+  background-image: none;
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+  color: #8b919c;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+button.flat:hover {
+  color: #f2f3f5;
+  background-color: rgba(255, 255, 255, 0.07);
+  border-radius: 8px;
+}
+button.flat:active { background-color: rgba(255, 255, 255, 0.12); }
+
+spinbutton {
+  background-image: none;
+  background-color: #2a2e37;
+  color: #e8eaed;
+  border: 1px solid #363b46;
+  border-radius: 9px;
+  min-height: 26px;
+  padding: 1px 2px;
+}
+spinbutton entry {
+  background-image: none;
+  background-color: transparent;
+  color: #e8eaed;
+  border: none;
+  box-shadow: none;
+  padding: 0 4px;
+}
+spinbutton button {
+  background-image: none;
+  background-color: transparent;
+  color: #cfd4dc;
+  border: none;
+  box-shadow: none;
+  min-width: 20px;
+  padding: 0;
+}
+spinbutton button:hover { background-color: rgba(255, 255, 255, 0.08); border-radius: 6px; }
+
+headerbar.kblock-header button.lang-button {
+  background-image: none;
+  background-color: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 1px 7px;
+  min-height: 22px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #b9c0cb;
+  box-shadow: none;
+  outline: none;
+}
+headerbar.kblock-header button.lang-button:hover {
+  background-color: rgba(255, 255, 255, 0.08);
+  color: #f2f3f5;
+}
+popover.background {
+  background-color: #22252c;
+  border: 1px solid #2f343e;
+  border-radius: 12px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+}
+popover.background contents { background-color: transparent; }
+popover button.lang-item {
+  background-image: none;
+  background-color: transparent;
+  border: none;
+  box-shadow: none;
+  border-radius: 8px;
+  padding: 5px 8px;
+}
+popover button.lang-item:hover { background-color: rgba(255, 255, 255, 0.08); }
+popover button.lang-item label { color: #e8eaed; font-size: 13px; }
+
+switch {
+  background-image: none;
+  background-color: #3a3f4b;
+  border-radius: 14px;
+  border: none;
+}
+switch:checked { background-color: #3d6fd8; }
+switch slider {
+  background-image: none;
+  background-color: #f2f3f5;
+  border-radius: 12px;
+  border: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+"""
+
+SNI_XML = """
+<node>
+  <interface name="org.kde.StatusNotifierItem">
+    <method name="Activate">
+      <arg type="i" direction="in"/>
+      <arg type="i" direction="in"/>
+    </method>
+    <method name="SecondaryActivate">
+      <arg type="i" direction="in"/>
+      <arg type="i" direction="in"/>
+    </method>
+    <method name="ContextMenu">
+      <arg type="i" direction="in"/>
+      <arg type="i" direction="in"/>
+    </method>
+    <method name="Scroll">
+      <arg type="i" direction="in"/>
+      <arg type="s" direction="in"/>
+    </method>
+    <property name="Category" type="s" access="read"/>
+    <property name="Id" type="s" access="read"/>
+    <property name="Title" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="WindowId" type="i" access="read"/>
+    <property name="IconName" type="s" access="read"/>
+    <property name="IconPixmap" type="a(iiay)" access="read"/>
+    <property name="OverlayIconName" type="s" access="read"/>
+    <property name="OverlayIconPixmap" type="a(iiay)" access="read"/>
+    <property name="AttentionIconName" type="s" access="read"/>
+    <property name="AttentionIconPixmap" type="a(iiay)" access="read"/>
+    <property name="AttentionMovieName" type="s" access="read"/>
+    <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+    <property name="ItemIsMenu" type="b" access="read"/>
+    <property name="Menu" type="o" access="read"/>
+  </interface>
+</node>
+"""
+
+MENU_XML = """
+<node>
+  <interface name="com.canonical.dbusmenu">
+    <method name="GetLayout">
+      <arg type="i" direction="in" name="parentId"/>
+      <arg type="i" direction="in" name="recursionDepth"/>
+      <arg type="as" direction="in" name="propertyNames"/>
+      <arg type="u" direction="out" name="revision"/>
+      <arg type="(ia{sv}av)" direction="out" name="layout"/>
+    </method>
+    <method name="GetGroupProperties">
+      <arg type="ai" direction="in" name="ids"/>
+      <arg type="as" direction="in" name="propertyNames"/>
+      <arg type="a(ia{sv})" direction="out" name="properties"/>
+    </method>
+    <method name="GetProperty">
+      <arg type="i" direction="in" name="id"/>
+      <arg type="s" direction="in" name="name"/>
+      <arg type="v" direction="out" name="value"/>
+    </method>
+    <method name="Event">
+      <arg type="i" direction="in" name="id"/>
+      <arg type="s" direction="in" name="eventId"/>
+      <arg type="v" direction="in" name="data"/>
+      <arg type="u" direction="in" name="timestamp"/>
+    </method>
+    <method name="EventGroup">
+      <arg type="a(isvu)" direction="in" name="events"/>
+      <arg type="ai" direction="out" name="idErrors"/>
+    </method>
+    <method name="AboutToShow">
+      <arg type="i" direction="in" name="id"/>
+      <arg type="b" direction="out" name="needUpdate"/>
+    </method>
+    <method name="AboutToShowGroup">
+      <arg type="ai" direction="in" name="ids"/>
+      <arg type="ai" direction="out" name="updatesNeeded"/>
+      <arg type="ai" direction="out" name="idErrors"/>
+    </method>
+    <signal name="LayoutUpdated">
+      <arg type="u" name="revision"/>
+      <arg type="i" name="parent"/>
+    </signal>
+    <signal name="ItemsPropertiesUpdated">
+      <arg type="a(ia{sv})" name="updatedProps"/>
+      <arg type="a(ias)" name="removedProps"/>
+    </signal>
+    <property name="Version" type="u" access="read"/>
+    <property name="TextDirection" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="IconThemePath" type="as" access="read"/>
+  </interface>
+</node>
+"""
+
+
+# --------------------------------------------------------------------------
+# конфигурация
+# --------------------------------------------------------------------------
+
+def default_config() -> dict:
+    return {
+        "timeout": DEFAULTS["timeout"],
+        "pointer": DEFAULTS["pointer"],
+        "language": detect_language(),
+    }
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            return default_config()
+        language = data.get("language")
+        if language not in TRANSLATIONS:
+            language = detect_language()
+        timeout = int(data.get("timeout", DEFAULTS["timeout"]))
+        timeout = max(5, min(7200, timeout))
+        return {
+            "timeout": timeout,
+            "pointer": bool(data.get("pointer", DEFAULTS["pointer"])),
+            "language": language,
+        }
+    except (OSError, ValueError, TypeError):
+        return default_config()
+
+
+def save_config(cfg: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh)
+        os.replace(tmp, CONFIG_PATH)
+    except OSError:
+        pass
+
+
+def find_kblock() -> str | None:
+    here = os.path.dirname(os.path.realpath(__file__))
+    candidates = [
+        os.path.join(here, "kblock"),
+        os.path.expanduser("~/.local/bin/kblock"),
+        shutil.which("kblock") or "",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def tray_icon_name() -> str:
+    theme = Gtk.IconTheme.get_default()
+    if theme.has_icon("kblock"):
+        return "kblock"
+    if theme.has_icon("input-keyboard"):
+        return "input-keyboard"
+    return "input-keyboard-symbolic"
+
+
+# --------------------------------------------------------------------------
+# трей: StatusNotifierItem + минимальный DBusMenu
+# --------------------------------------------------------------------------
+
+class Tray:
+    def __init__(self, app: Gtk.Application, window: "MainWindow") -> None:
+        self.app = app
+        self.window = window
+        self.bus_name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+        self.connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.revision = 1
+        self._owner_id = Gio.bus_own_name_on_connection(
+            self.connection, self.bus_name, Gio.BusNameOwnerFlags.NONE,
+            self._on_name_acquired, None,
+        )
+
+    # -- SNI ---------------------------------------------------------------
+    def _on_name_acquired(self, connection: Gio.DBusConnection, name: str) -> None:
+        self._export_sni()
+        self._export_menu()
+        try:
+            connection.call_sync(
+                "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
+                "org.kde.StatusNotifierWatcher", "RegisterStatusNotifierItem",
+                GLib.Variant("(s)", (self.bus_name,)), None,
+                Gio.DBusCallFlags.NONE, 3000, None,
+            )
+        except GLib.Error as exc:
+            print(f"kblock-gui: системный лоток недоступен: {exc.message}", file=sys.stderr)
+
+    def _export_sni(self) -> None:
+        node = Gio.DBusNodeInfo.new_for_xml(SNI_XML)
+        iface = node.lookup_interface("org.kde.StatusNotifierItem")
+        icon = tray_icon_name()
+        self.sni_props = {
+            "Category": GLib.Variant("s", "ApplicationStatus"),
+            "Id": GLib.Variant("s", "kblock"),
+            "Title": GLib.Variant("s", "kblock"),
+            "Status": GLib.Variant("s", "Active"),
+            "WindowId": GLib.Variant("i", 0),
+            "IconName": GLib.Variant("s", icon),
+            "IconPixmap": GLib.Variant("a(iiay)", []),
+            "OverlayIconName": GLib.Variant("s", ""),
+            "OverlayIconPixmap": GLib.Variant("a(iiay)", []),
+            "AttentionIconName": GLib.Variant("s", ""),
+            "AttentionIconPixmap": GLib.Variant("a(iiay)", []),
+            "AttentionMovieName": GLib.Variant("s", ""),
+            "ToolTip": GLib.Variant("(sa(iiay)ss)", (
+                "", [], "kblock", self.window._t("tooltip_body"),
+            )),
+            "ItemIsMenu": GLib.Variant("b", False),
+            "Menu": GLib.Variant("o", "/MenuBar"),
+        }
+        self.connection.register_object(
+            "/StatusNotifierItem", iface, self._on_sni_method, self._on_sni_prop, None,
+        )
+
+    def _on_sni_prop(self, _conn, _sender, _path, _iface, prop):
+        return self.sni_props.get(prop, GLib.Variant("s", ""))
+
+    def _on_sni_method(self, _conn, _sender, _path, _iface, method, params, invocation):
+        if method in ("Activate", "SecondaryActivate", "ContextMenu"):
+            self.window.present()
+        invocation.return_value(None)
+
+    # -- DBusMenu ----------------------------------------------------------
+    def _export_menu(self) -> None:
+        node = Gio.DBusNodeInfo.new_for_xml(MENU_XML)
+        iface = node.lookup_interface("com.canonical.dbusmenu")
+        self.menu_props = {
+            "Version": GLib.Variant("u", 3),
+            "TextDirection": GLib.Variant("s", "ltr"),
+            "Status": GLib.Variant("s", "normal"),
+            "IconThemePath": GLib.Variant("as", []),
+        }
+        self.connection.register_object(
+            "/MenuBar", iface, self._on_menu_method, self._on_menu_prop, None,
+        )
+
+    def _on_menu_prop(self, _conn, _sender, _path, _iface, prop):
+        return self.menu_props.get(prop, GLib.Variant("u", 0))
+
+    def _menu_item(self, item_id: int, props: dict, children: tuple = ()) -> tuple:
+        """Узел меню: (id, {свойство: GVariant}, [дочерние узлы])."""
+        return (
+            item_id,
+            {key: GLib.Variant(*value) for key, value in props.items()},
+            list(children),
+        )
+
+    def _layout(self) -> tuple:
+        locked = self.window.proc is not None
+        return self._menu_item(0, {"children-display": ("s", "submenu")}, (
+            self._menu_item(1, {
+                "label": ("s", self.window._t("tray_open")),
+                "enabled": ("b", True),
+                "visible": ("b", True),
+            }),
+            self._menu_item(2, {
+                "label": ("s", self.window._t("tray_lock")),
+                "enabled": ("b", not locked),
+                "visible": ("b", True),
+            }),
+            self._menu_item(4, {
+                "type": ("s", "separator"),
+                "visible": ("b", True),
+            }),
+            self._menu_item(3, {
+                "label": ("s", self.window._t("tray_quit")),
+                "enabled": ("b", True),
+                "visible": ("b", True),
+            }),
+        ))
+
+    def _props_variant(self, props: dict) -> GLib.Variant:
+        builder = GLib.VariantBuilder.new(GLib.VariantType.new("a{sv}"))
+        for key, value in props.items():
+            builder.add_value(GLib.Variant("{sv}", (key, value)))
+        return builder.end()
+
+    def _node_variant(self, node: tuple) -> GLib.Variant:
+        item_id, props, children = node
+        builder = GLib.VariantBuilder.new(GLib.VariantType.new("(ia{sv}av)"))
+        builder.add_value(GLib.Variant("i", item_id))
+        builder.add_value(self._props_variant(props))
+        child_builder = GLib.VariantBuilder.new(GLib.VariantType.new("av"))
+        for child in children:
+            child_builder.add_value(GLib.Variant.new_variant(self._node_variant(child)))
+        builder.add_value(child_builder.end())
+        return builder.end()
+
+    def _layout_variant(self) -> GLib.Variant:
+        builder = GLib.VariantBuilder.new(GLib.VariantType.new("(u(ia{sv}av))"))
+        builder.add_value(GLib.Variant("u", self.revision))
+        builder.add_value(self._node_variant(self._layout()))
+        return builder.end()
+
+    def _flatten(self, node: tuple, out: list) -> None:
+        out.append(node)
+        for child in node[2]:
+            self._flatten(child, out)
+
+    def _on_menu_method(self, _conn, _sender, _path, _iface, method, params, invocation):
+        try:
+            self._menu_method(method, params, invocation)
+        except Exception as exc:  # noqa: BLE001 — не роняем приложение из-за D-Bus
+            try:
+                invocation.return_error_literal(
+                    Gio.DBusError, Gio.DBusError.FAILED, str(exc),
+                )
+            except Exception:
+                pass
+
+    def _menu_method(self, method, params, invocation):
+        if method == "GetLayout":
+            response = self._layout_variant()
+        elif method == "GetGroupProperties":
+            ids, _names = params.unpack()
+            wanted = set(ids) if ids else {0, 1, 2, 3, 4}
+            flat = []
+            self._flatten(self._layout(), flat)
+            array = GLib.VariantBuilder.new(GLib.VariantType.new("a(ia{sv})"))
+            for item_id, props, _children in flat:
+                if item_id not in wanted:
+                    continue
+                item_builder = GLib.VariantBuilder.new(GLib.VariantType.new("(ia{sv})"))
+                item_builder.add_value(GLib.Variant("i", item_id))
+                item_builder.add_value(self._props_variant(props))
+                array.add_value(item_builder.end())
+            outer = GLib.VariantBuilder.new(GLib.VariantType.new("(a(ia{sv}))"))
+            outer.add_value(array.end())
+            response = outer.end()
+        elif method == "GetProperty":
+            item_id, prop = params.unpack()
+            flat = []
+            self._flatten(self._layout(), flat)
+            item = next((entry for entry in flat if entry[0] == item_id), None)
+            value = item[1].get(prop, GLib.Variant("s", "")) if item else GLib.Variant("s", "")
+            outer = GLib.VariantBuilder.new(GLib.VariantType.new("(v)"))
+            outer.add_value(GLib.Variant.new_variant(value))
+            response = outer.end()
+        elif method == "Event":
+            item_id, event, _data, _ts = params.unpack()
+            if event == "clicked":
+                self._activate_item(item_id)
+            response = None
+        elif method == "EventGroup":
+            events, = params.unpack()
+            for item_id, event, _data, _ts in events:
+                if event == "clicked":
+                    self._activate_item(item_id)
+            response = GLib.Variant("(ai)", ([],))
+        elif method == "AboutToShow":
+            self._bump_revision()
+            response = GLib.Variant("(b)", (True,))
+        elif method == "AboutToShowGroup":
+            response = GLib.Variant("(aiai)", ([], []))
+        else:
+            invocation.return_error_literal(
+                Gio.DBusError, Gio.DBusError.UNKNOWN_METHOD, f"unknown method {method}",
+            )
+            return
+        invocation.return_value(response)
+
+    def _bump_revision(self) -> None:
+        self.revision += 1
+
+    def refresh_texts(self) -> None:
+        """Обновляет подсказку значка после смены языка."""
+        if not hasattr(self, "sni_props"):
+            return
+        self.sni_props["ToolTip"] = GLib.Variant("(sa(iiay)ss)", (
+            "", [], "kblock", self.window._t("tooltip_body"),
+        ))
+        try:
+            self.connection.emit_signal(
+                None, "/StatusNotifierItem", "org.freedesktop.DBus.Properties",
+                "PropertiesChanged", GLib.Variant("(sa{sv}as)", (
+                    "org.kde.StatusNotifierItem",
+                    {"ToolTip": self.sni_props["ToolTip"]},
+                    [],
+                )),
+            )
+        except GLib.Error:
+            pass
+
+    def _activate_item(self, item_id: int) -> None:
+        if item_id == 1:
+            self.window.present()
+        elif item_id == 2:
+            self.window.present()
+            self.window.lock_now()
+        elif item_id == 3:
+            self.app.quit()
+
+
+# --------------------------------------------------------------------------
+# главное окно
+# --------------------------------------------------------------------------
+
+class HoldRing(Gtk.Image):
+    """Кольцо прогресса удержания Esc поверх круглой кнопки.
+
+    Кадры рисуются в SVG и загружаются через GdkPixbuf, без дополнительных
+    зависимостей.
+    """
+
+    STEPS = 60
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.set_no_show_all(True)
+        self.set_halign(Gtk.Align.FILL)
+        self.set_valign(Gtk.Align.FILL)
+        self.value = 0.0
+        self.target = 0.0
+        self._source = 0
+        self._cache = {}
+        self.hide()
+
+    def _frame(self, index: int):
+        pixbuf = self._cache.get(index)
+        if pixbuf is None:
+            progress = index / self.STEPS
+            circumference = 2 * math.pi * 93
+            dash = circumference * progress
+            svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">
+<circle cx="100" cy="100" r="93" fill="none" stroke="#ffffff" stroke-opacity="0.22" stroke-width="6"/>
+<circle cx="100" cy="100" r="93" fill="none" stroke="#95b8ff" stroke-width="6" stroke-linecap="round"
+ stroke-dasharray="{dash:.2f} {circumference:.2f}" transform="rotate(-90 100 100)"/>
+</svg>"""
+            try:
+                loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+                loader.write(svg.encode("utf-8"))
+                loader.close()
+                pixbuf = loader.get_pixbuf()
+            except (GLib.Error, TypeError):
+                pixbuf = None
+            if pixbuf is None:
+                return None
+            self._cache[index] = pixbuf
+        return pixbuf
+
+    def _render(self) -> None:
+        index = int(round(self.value * self.STEPS))
+        if index <= 0:
+            self.hide()
+            return
+        pixbuf = self._frame(index)
+        if pixbuf is None:
+            self.hide()
+            return
+        self.set_from_pixbuf(pixbuf)
+        self.show()
+
+    def set_target(self, value: float) -> None:
+        value = max(0.0, min(1.0, float(value)))
+        self.target = value
+        if self._source == 0:
+            self._source = GLib.timeout_add(16, self._step)
+
+    def reset(self) -> None:
+        if self._source:
+            GLib.source_remove(self._source)
+            self._source = 0
+        self.value = 0.0
+        self.target = 0.0
+        self.hide()
+
+    def _step(self) -> bool:
+        diff = self.target - self.value
+        if abs(diff) < 0.004:
+            self.value = self.target
+            self._render()
+            self._source = 0
+            if self.value <= 0.001:
+                self.value = 0.0
+                self.hide()
+            return False
+        self.value += diff * 0.35
+        self._render()
+        return True
+
+
+class MainWindow(Gtk.ApplicationWindow):
+    def __init__(self, app: Gtk.Application) -> None:
+        super().__init__(application=app, title="kblock")
+        self.app = app
+        self.cfg = load_config()
+        override = getattr(app, "lang_override", None)
+        self.lang = override if override in TRANSLATIONS else self.cfg["language"]
+        if override in TRANSLATIONS and override != self.cfg["language"]:
+            self.cfg["language"] = override
+            save_config(self.cfg)
+        self.kblock = find_kblock()
+        self.proc: subprocess.Popen | None = None
+        self.deadline = 0.0
+        self.duration = int(self.cfg["timeout"])
+        self._user_stopped = False
+        self._tick_source = 0
+        self._progress_source = 0
+        self._term_sent = False
+        self._kill_sent = False
+        self._status_source = 0
+        self._status_key = None
+        self._status_fmt = {}
+        self._status_error = False
+        self._status_ok = False
+
+        self.get_style_context().add_class("kblock-window")
+        self.set_decorated(False)
+        self.set_app_paintable(True)
+        screen = self.get_screen()
+        composited = bool(screen is not None and screen.is_composited())
+        if composited:
+            visual = screen.get_rgba_visual()
+            if visual is not None:
+                self.set_visual(visual)
+        self.set_icon_name("kblock" if Gtk.IconTheme.get_default().has_icon("kblock")
+                           else "input-keyboard")
+        self.set_default_size(400, -1)
+        self.set_resizable(False)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.connect("delete-event", self._on_delete)
+        self.connect("button-press-event", self._on_window_press)
+
+        self._build_ui()
+        self.root.show_all()
+        self.big.hide()
+        if not composited:
+            # Без композитора прозрачность не работает: делаем обычное окно.
+            self.get_style_context().add_class("no-composite")
+            self.frame.get_style_context().add_class("no-composite")
+
+
+        if not self.kblock:
+            self._set_status_key("status_missing", error=True)
+            self.button.set_sensitive(False)
+
+    # -- построение интерфейса --------------------------------------------
+    def _build_ui(self) -> None:
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.root = root
+        self.add(root)
+
+        self.frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.frame.get_style_context().add_class("frame")
+        root.pack_start(self.frame, True, True, 0)
+
+        bar = self._build_headerbar()
+        self.frame.pack_start(bar, False, False, 0)
+
+        content = self._build_content()
+        self.frame.pack_start(content, True, True, 0)
+
+    def _on_window_press(self, _widget, event) -> bool:
+        if event.button != 1 or not hasattr(self, "headerbar"):
+            return False
+        alloc = self.headerbar.get_allocation()
+        origin = self.headerbar.translate_coordinates(self, 0, 0)
+        if origin is None:
+            return False
+        ox, oy = origin
+        if not (ox <= event.x < ox + alloc.width and oy <= event.y < oy + alloc.height):
+            return False
+        target = Gtk.get_event_widget(event)
+        widget = target
+        while widget is not None:
+            if isinstance(widget, Gtk.Button):
+                return False
+            widget = widget.get_parent()
+        self.begin_move_drag(event.button, int(event.x_root), int(event.y_root), event.time)
+        return True
+
+    def _build_headerbar(self) -> Gtk.HeaderBar:
+        bar = Gtk.HeaderBar()
+        bar.set_show_close_button(True)
+        bar.get_style_context().add_class("kblock-header")
+        self._build_language_button()
+        bar.pack_start(self.lang_button)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        image = Gtk.Image.new_from_icon_name(self.get_icon_name(), Gtk.IconSize.BUTTON)
+        image.set_pixel_size(20)
+        label = Gtk.Label(label="kblock")
+        label.get_style_context().add_class("title")
+        box.pack_start(image, False, False, 0)
+        box.pack_start(label, False, False, 0)
+        bar.set_custom_title(box)
+        self.headerbar = bar
+        return bar
+
+    def _build_language_button(self) -> None:
+        self.lang_button = Gtk.MenuButton()
+        self.lang_button.set_relief(Gtk.ReliefStyle.NONE)
+        self.lang_button.set_valign(Gtk.Align.CENTER)
+        self.lang_button.get_style_context().add_class("lang-button")
+        self.lang_button.set_label(LANG_SHORT.get(self.lang, self.lang.upper()))
+        self.lang_button.set_tooltip_text(self._t("language"))
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.set_margin_start(6)
+        box.set_margin_end(6)
+
+        popover = Gtk.Popover.new(self.lang_button)
+        popover.add(box)
+        self.lang_button.set_popover(popover)
+
+        self.lang_items = {}
+        for code, name in LANGUAGES:
+            item = Gtk.Button()
+            item.set_relief(Gtk.ReliefStyle.NONE)
+            item.get_style_context().add_class("lang-item")
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            label = Gtk.Label(label=name)
+            label.set_xalign(0)
+            row.pack_start(label, True, True, 0)
+            check = Gtk.Image.new_from_icon_name(
+                "object-select-symbolic", Gtk.IconSize.MENU,
+            )
+            check.set_opacity(1.0 if code == self.lang else 0.0)
+            row.pack_end(check, False, False, 0)
+            item.add(row)
+            item.connect("clicked", self._on_lang_item, code)
+            box.pack_start(item, False, False, 0)
+            self.lang_items[code] = check
+        box.show_all()
+
+    def _build_content(self) -> Gtk.Box:
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        outer.set_margin_top(18)
+        outer.set_margin_bottom(16)
+        outer.set_margin_start(22)
+        outer.set_margin_end(22)
+
+        self.subtitle_label = Gtk.Label(label=self._t("subtitle"))
+        self.subtitle_label.get_style_context().add_class("subtitle")
+        self.subtitle_label.set_xalign(0.5)
+        outer.pack_start(self.subtitle_label, False, False, 0)
+
+        # круглая кнопка
+        self.button = Gtk.Button()
+        self.button.set_size_request(200, 200)
+        self.button.set_halign(Gtk.Align.CENTER)
+        self.button.set_valign(Gtk.Align.CENTER)
+        self.button.get_style_context().add_class("lock")
+        self.button.connect("clicked", self._on_button_clicked)
+
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        inner.set_halign(Gtk.Align.CENTER)
+        inner.set_valign(Gtk.Align.CENTER)
+
+        self.big = Gtk.Label(label="")
+        self.big.get_style_context().add_class("big")
+        self.big.hide()
+
+        self.icon = Gtk.Image.new_from_icon_name(
+            "input-keyboard-symbolic", Gtk.IconSize.DIALOG,
+        )
+        self.icon.set_pixel_size(64)
+
+        self.action_label = Gtk.Label(label=self._t("lock"))
+
+        self.caption = Gtk.Label(label="")
+        self.caption.get_style_context().add_class("caption")
+
+        inner.pack_start(self.big, False, False, 0)
+        inner.pack_start(self.icon, False, False, 0)
+        inner.pack_start(self.action_label, False, False, 0)
+        inner.pack_start(self.caption, False, False, 0)
+
+        self.ring = HoldRing()
+        overlay = Gtk.Overlay()
+        overlay.add(inner)
+        overlay.add_overlay(self.ring)
+        self.button.add(overlay)
+        outer.pack_start(self.button, False, False, 0)
+
+        self.hint = Gtk.Label(label=self._t("hint_idle"))
+        self.hint.get_style_context().add_class("hint")
+        self.hint.set_line_wrap(True)
+        self.hint.set_max_width_chars(46)
+        self.hint.set_justify(Gtk.Justification.CENTER)
+        self.hint.set_xalign(0.5)
+        outer.pack_start(self.hint, False, False, 0)
+
+        # карточка настроек
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        card.get_style_context().add_class("card")
+        card_inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        card_inner.set_margin_top(14)
+        card_inner.set_margin_bottom(14)
+        card_inner.set_margin_start(16)
+        card_inner.set_margin_end(16)
+        card.pack_start(card_inner, True, True, 0)
+        outer.pack_start(card, False, False, 0)
+
+        row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.time_title = Gtk.Label(label=self._t("time_title"))
+        self.time_title.set_xalign(0)
+        row1.pack_start(self.time_title, True, True, 0)
+
+        self.spin = Gtk.SpinButton.new_with_range(5, 7200, 5)
+        self.spin.set_numeric(True)
+        self.spin.set_width_chars(4)
+        self.spin.set_value(self.cfg["timeout"])
+        self.spin.connect("value-changed", self._on_settings_changed)
+        row1.pack_start(self.spin, False, False, 0)
+
+        self.unit = Gtk.Label(label=self._t("unit"))
+        self.unit.get_style_context().add_class("subtitle")
+        row1.pack_start(self.unit, False, False, 0)
+        card_inner.pack_start(row1, False, False, 0)
+
+        row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.pointer_title = Gtk.Label(label=self._t("pointer_title"))
+        self.pointer_title.set_xalign(0)
+        self.pointer_subtitle = Gtk.Label(label=self._t("pointer_subtitle"))
+        self.pointer_subtitle.get_style_context().add_class("subtitle")
+        self.pointer_subtitle.set_xalign(0)
+        texts.pack_start(self.pointer_title, False, False, 0)
+        texts.pack_start(self.pointer_subtitle, False, False, 0)
+        row2.pack_start(texts, True, True, 0)
+
+        self.switch = Gtk.Switch()
+        self.switch.set_active(self.cfg["pointer"])
+        self.switch.set_valign(Gtk.Align.CENTER)
+        self.switch.connect("notify::active", self._on_settings_changed)
+        row2.pack_end(self.switch, False, False, 0)
+        card_inner.pack_start(row2, False, False, 0)
+
+        # статус и подвал
+        self.status = Gtk.Label(label="")
+        self.status.get_style_context().add_class("status")
+        self.status.set_line_wrap(True)
+        self.status.set_max_width_chars(46)
+        self.status.set_justify(Gtk.Justification.CENTER)
+        self.status.set_xalign(0.5)
+        self.status.set_size_request(-1, 18)
+        outer.pack_start(self.status, False, False, 0)
+
+        footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        footer.set_halign(Gtk.Align.CENTER)
+        self.collapse_btn = Gtk.Button(label=self._t("collapse"))
+        self.collapse_btn.get_style_context().add_class("flat")
+        self.collapse_btn.connect("clicked", lambda *_: self.hide())
+        self.quit_btn = Gtk.Button(label=self._t("quit"))
+        self.quit_btn.get_style_context().add_class("flat")
+        self.quit_btn.connect("clicked", lambda *_: self.app.quit())
+        footer.pack_start(self.collapse_btn, False, False, 0)
+        footer.pack_start(self.quit_btn, False, False, 0)
+        outer.pack_start(footer, False, False, 0)
+
+        self.content = outer
+        self._update_idle_button()
+        return outer
+
+    # -- настройки ---------------------------------------------------------
+    def _on_settings_changed(self, *_args) -> None:
+        self.cfg = {
+            "timeout": int(self.spin.get_value()),
+            "pointer": bool(self.switch.get_active()),
+            "language": self.lang,
+        }
+        if self.proc is None:
+            self._update_idle_button()
+        save_config(self.cfg)
+
+    def _update_idle_button(self) -> None:
+        seconds = int(self.spin.get_value())
+        self.action_label.set_text(self._t("lock"))
+        self.caption.set_text(self._t("caption", seconds=seconds))
+
+    def _t(self, key: str, **fmt) -> str:
+        table = TRANSLATIONS.get(self.lang) or TRANSLATIONS["ru"]
+        text = table.get(key) or TRANSLATIONS["ru"].get(key, key)
+        return text.format(**fmt) if fmt else text
+
+    def _on_lang_item(self, _button, code: str) -> None:
+        popover = self.lang_button.get_popover()
+        if popover is not None:
+            popover.popdown()
+        if code not in TRANSLATIONS or code == self.lang:
+            return
+        self.lang = code
+        self.cfg["language"] = code
+        save_config(self.cfg)
+        self._apply_language()
+        tray = getattr(self.app, "tray", None)
+        if tray is not None:
+            tray.refresh_texts()
+
+    def _apply_language(self) -> None:
+        self.subtitle_label.set_text(self._t("subtitle"))
+        self.time_title.set_text(self._t("time_title"))
+        self.pointer_title.set_text(self._t("pointer_title"))
+        self.pointer_subtitle.set_text(self._t("pointer_subtitle"))
+        self.unit.set_text(self._t("unit"))
+        self.lang_button.set_label(LANG_SHORT.get(self.lang, self.lang.upper()))
+        self.lang_button.set_tooltip_text(self._t("language"))
+        for code, check in self.lang_items.items():
+            check.set_opacity(1.0 if code == self.lang else 0.0)
+        self.collapse_btn.set_label(self._t("collapse"))
+        self.quit_btn.set_label(self._t("quit"))
+        if self.proc is None:
+            self.hint.set_text(self._t("hint_idle"))
+            self._update_idle_button()
+        else:
+            self.hint.set_text(
+                self._t("hint_locked_pointer") if self.switch.get_active()
+                else self._t("hint_locked")
+            )
+            self.caption.set_text(self._t("unit"))
+        if self._status_key:
+            self._show_status(
+                self._t(self._status_key, **self._status_fmt),
+                self._status_error, self._status_ok, 0,
+            )
+
+    # -- статус ------------------------------------------------------------
+    def _set_status(self, text: str, error: bool = False, ok: bool = False,
+                    clear_after: float = 0) -> None:
+        self._status_key = None
+        self._status_fmt = {}
+        self._show_status(text, error, ok, clear_after)
+
+    def _set_status_key(self, key: str, error: bool = False, ok: bool = False,
+                        clear_after: float = 0, **fmt) -> None:
+        self._status_key = key
+        self._status_fmt = fmt
+        self._show_status(self._t(key, **fmt), error, ok, clear_after)
+
+    def _show_status(self, text: str, error: bool = False, ok: bool = False,
+                     clear_after: float = 0) -> None:
+        self._status_error = error
+        self._status_ok = ok
+        ctx = self.status.get_style_context()
+        ctx.remove_class("error")
+        ctx.remove_class("ok")
+        if error:
+            ctx.add_class("error")
+        elif ok:
+            ctx.add_class("ok")
+        self.status.set_text(text)
+        if self._status_source:
+            GLib.source_remove(self._status_source)
+            self._status_source = 0
+        if text and clear_after > 0:
+            self._status_source = GLib.timeout_add(
+                int(clear_after * 1000), self._clear_status,
+            )
+
+    def _clear_status(self) -> bool:
+        self._status_source = 0
+        self._status_key = None
+        self.status.set_text("")
+        self.status.set_tooltip_text(None)
+        return False
+
+    # -- блокировка --------------------------------------------------------
+    def lock_now(self) -> None:
+        if self.proc is not None:
+            return
+        if not self.kblock:
+            self._set_status_key("status_missing", error=True)
+            return
+
+        self.duration = int(self.spin.get_value())
+        args = [self.kblock, "-t", str(self.duration), "--progress"]
+        if self.switch.get_active():
+            args.append("-p")
+        self._user_stopped = False
+        self.ring.reset()
+        try:
+            self.proc = subprocess.Popen(
+                args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+        except OSError as exc:
+            self.proc = None
+            self._set_status_key("status_launch_failed", error=True, err=exc)
+            return
+
+        if self.proc.stdout is not None:
+            self._progress_source = GLib.io_add_watch(
+                self.proc.stdout, GLib.IO_IN | GLib.IO_HUP, self._on_progress,
+            )
+        self.deadline = time.monotonic() + self.duration
+        self._term_sent = False
+        self._kill_sent = False
+        self._set_status("")
+        self._enter_locked_ui()
+        if self._tick_source:
+            GLib.source_remove(self._tick_source)
+        self._tick_source = GLib.timeout_add(200, self._tick)
+
+    def _enter_locked_ui(self) -> None:
+        self.icon.hide()
+        self.action_label.hide()
+        self.big.show()
+        self.big.set_text(str(self.duration))
+        self.caption.set_text(self._t("unit"))
+        self.button.get_style_context().add_class("locked")
+        self.spin.set_sensitive(False)
+        self.switch.set_sensitive(False)
+        self.hint.set_text(
+            self._t("hint_locked_pointer") if self.switch.get_active()
+            else self._t("hint_locked")
+        )
+        self.set_keep_above(True)
+
+    def _leave_locked_ui(self) -> None:
+        self.ring.reset()
+        self.button.get_style_context().remove_class("locked")
+        self.big.hide()
+        self.icon.show()
+        self.action_label.show()
+        self.spin.set_sensitive(True)
+        self.switch.set_sensitive(True)
+        self.hint.set_text(self._t("hint_idle"))
+        self.set_keep_above(False)
+        self._update_idle_button()
+
+    def _on_progress(self, source, _condition) -> bool:
+        try:
+            line = source.readline()
+        except (OSError, ValueError):
+            self._progress_source = 0
+            return False
+        if not line:
+            self._progress_source = 0
+            return False
+        if line.startswith("HOLD "):
+            parts = line.split()
+            if len(parts) == 3:
+                try:
+                    held, total = float(parts[1]), float(parts[2])
+                except ValueError:
+                    return True
+                if total > 0:
+                    self.ring.set_target(min(1.0, held / total))
+        return True
+
+    def _tick(self) -> bool:
+        if self.proc is None:
+            self._tick_source = 0
+            return False
+        code = self.proc.poll()
+        if code is not None:
+            self._finish_lock(code)
+            return False
+
+        now = time.monotonic()
+        overdue = now - self.deadline
+        if overdue > 3.0 and not self._term_sent:
+            self._term_sent = True
+            try:
+                self.proc.terminate()
+            except OSError:
+                pass
+        elif overdue > 6.0 and not self._kill_sent:
+            self._kill_sent = True
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+
+        remaining = max(0.0, self.deadline - now)
+        self.big.set_text(str(math.ceil(remaining)))
+        return True
+
+    def _finish_lock(self, code: int) -> None:
+        if self.proc is None:
+            return
+        proc, self.proc = self.proc, None
+        self._tick_source = 0
+        if self._progress_source:
+            GLib.source_remove(self._progress_source)
+            self._progress_source = 0
+        try:
+            proc.stdout.close()
+        except (OSError, ValueError, AttributeError):
+            pass
+        self.ring.reset()
+
+        err = ""
+        try:
+            err = proc.stderr.read() or ""
+        except (OSError, ValueError):
+            pass
+        try:
+            proc.stderr.close()
+        except (OSError, ValueError, AttributeError):
+            pass
+
+        finished = time.monotonic()
+        self._leave_locked_ui()
+
+        if self._user_stopped:
+            self._set_status_key("status_stopped", clear_after=3)
+        elif code == 3:
+            self._set_status_key("status_no_input_access", error=True)
+        elif code == 0 or (code in (-15, -9) and finished >= self.deadline):
+            if finished >= self.deadline - 0.5:
+                self._set_status_key("status_timeout", ok=True, clear_after=5)
+            else:
+                self._set_status_key("status_esc", ok=True, clear_after=5)
+        else:
+            self._set_status_key("status_error", error=True)
+
+        details = err.strip()
+        self.status.set_tooltip_text(details or None)
+
+    # -- события окна ------------------------------------------------------
+    def _on_button_clicked(self, _button) -> None:
+        if self.proc is not None:
+            self._user_stopped = True
+            try:
+                self.proc.terminate()
+            except OSError:
+                pass
+        else:
+            self.lock_now()
+
+    def _on_delete(self, *_args) -> bool:
+        self.hide()
+        return True
+
+
+# --------------------------------------------------------------------------
+# приложение
+# --------------------------------------------------------------------------
+
+class KblockApp(Gtk.Application):
+    def __init__(self, hidden: bool = False, lang: str | None = None) -> None:
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.FLAGS_NONE)
+        self.hidden = hidden
+        self.lang_override = lang
+        self.window: MainWindow | None = None
+        self.tray: Tray | None = None
+        self.connect("shutdown", self._on_shutdown)
+
+    def do_startup(self) -> None:
+        Gtk.Application.do_startup(self)
+        settings = Gtk.Settings.get_default()
+        if settings is not None:
+            settings.set_property("gtk-application-prefer-dark-theme", True)
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        screen = Gdk.Screen.get_default()
+        if screen is not None:
+            Gtk.StyleContext.add_provider_for_screen(
+                screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            )
+
+    def do_activate(self) -> None:
+        if self.window is None:
+            self.window = MainWindow(self)
+            self.add_window(self.window)
+            try:
+                self.tray = Tray(self, self.window)
+            except GLib.Error as exc:
+                print(f"kblock-gui: трей недоступен: {exc.message}", file=sys.stderr)
+        if self.hidden:
+            self.hidden = False
+        else:
+            self.window.present()
+
+    def _on_shutdown(self, *_args) -> None:
+        if self.window is not None and self.window.proc is not None:
+            try:
+                self.window.proc.terminate()
+            except OSError:
+                pass
+
+
+def main() -> int:
+    GLib.set_prgname("kblock-gui")
+    GLib.set_application_name("kblock")
+    hidden = False
+    lang = None
+    argv = [sys.argv[0]]
+    index = 1
+    while index < len(sys.argv):
+        arg = sys.argv[index]
+        if arg == "--hidden":
+            hidden = True
+        elif arg == "--lang" and index + 1 < len(sys.argv):
+            lang = sys.argv[index + 1]
+            index += 1
+        elif arg.startswith("--lang="):
+            lang = arg.split("=", 1)[1]
+        else:
+            argv.append(arg)
+        index += 1
+    if lang not in TRANSLATIONS:
+        lang = None
+
+    app = KblockApp(hidden=hidden, lang=lang)
+
+    def _quit(_signum: int = 0) -> bool:
+        app.quit()
+        return False
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, _quit)
+
+    try:
+        return app.run(argv)
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
